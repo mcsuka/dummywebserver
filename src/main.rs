@@ -1,8 +1,10 @@
 #[macro_use]
 extern crate rocket;
 
-use std::collections::HashMap;
+use dashmap::DashMap;
 
+use rocket::State;
+use rocket::http::{ContentType, Status};
 use rocket::serde::{json::Json, Deserialize};
 use rocket::tokio::time::{sleep, Duration};
 
@@ -10,15 +12,18 @@ use rocket_okapi::okapi::schemars;
 use rocket_okapi::okapi::schemars::JsonSchema;
 use rocket_okapi::settings::UrlObject;
 use rocket_okapi::{openapi, openapi_get_routes, rapidoc::*, swagger_ui::*};
+use serde::Serialize;
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(crate = "rocket::serde")]
-struct Greeting<'r> {
-    text: &'r str,
+struct Greeting {
+    text: String,
     id: u32,
 }
 
-static mut GREETINGS: Option<HashMap<u32, String>> = None;
+struct AllGreetings {
+    gr: DashMap<u32, String>,
+}
 
 /// Returns `"Hello World!"`
 #[openapi(tag = "Hello")]
@@ -28,29 +33,51 @@ fn index() -> &'static str {
 }
 
 /**
- Return the message provided in the query string
- */
+Return the message provided in the query string
+*/
 #[openapi(tag = "Hello")]
 #[get("/query?<text>")]
 fn query(text: &str) -> String {
     format!("{}", text)
 }
 
-/**
- ***Retrieve*** a **message** *inserted* by `POST`
- */
+/// I'm a teapot
 #[openapi(tag = "Hello")]
-#[get("/retrieve/<id>")]
-fn retrieve(id: u32) -> String {
-    unsafe {
-        let x = GREETINGS.as_ref().unwrap().get(&id);
-        format!("{:?}", x)
-    }
+#[get("/teapot")]
+fn teapot() -> (Status, (ContentType, &'static str)) {
+    (Status::ImATeapot, (ContentType::JSON, "{ \"status\": 418,  \"description\": \"the server refuses to brew coffee because it is, permanently, a teapot\"}"))
+}
+
+/// List all greetings
+#[openapi(tag = "Hello")]
+#[get("/greetings")]
+fn greetings(all_greetings: &State<AllGreetings>) -> Json<Vec<Greeting>> {
+    let greetings = all_greetings.gr.iter()
+        .map(|entry| Greeting {
+            id: *entry.key(),
+            text: entry.value().to_owned(),
+        })
+        .collect();
+
+    Json(greetings)
 }
 
 /**
- Return *"Hello \<message\>!"*
+ ***Retrieve*** a **greeting** *with* by `id`
  */
+#[openapi(tag = "Hello")]
+#[get("/greetings/<id>")]
+fn retrieve(all_greetings: &State<AllGreetings>, id: u32) -> String {
+    let x = match all_greetings.gr.get(&id) {
+        Some(rref) => Some(rref.value().to_owned()),
+        None => None
+    };
+    format!("{:?}", x)
+}
+
+/**
+Return *"Hello \<message\>!"*
+*/
 #[openapi(tag = "Hello")]
 #[get("/<message>")]
 fn greet(message: &str) -> String {
@@ -58,38 +85,37 @@ fn greet(message: &str) -> String {
 }
 
 /**
- Add a new message, identified by the id
- */
+Add a new greeting, identified by the `id`
+*/
 #[openapi(tag = "Hello")]
 #[post("/", data = "<input>")]
-fn new(input: Json<Greeting<'_>>) {
-    unsafe {
-        match &mut GREETINGS {
-            Some(gr) => {
-                gr.insert(input.id, input.text.to_string());
-            }
-            None => panic!("greetings must be set up!"),
-        }
+fn new(all_greetings: &State<AllGreetings>, input: Json<Greeting>) -> (Status, &'static str) {
+    let x = all_greetings.gr.entry(input.id).or_insert_with(|| input.text.to_owned());
+    if x.value() == &input.text {
+        (Status::Created, "")
+    } else {
+        (Status::Conflict, "Greeting with id already exists")
     }
 }
 
 /**
- Asynchronous process waiting n seconds before returning
- */
+Asynchronous process waiting n seconds before returning
+*/
 #[openapi(tag = "Async Process")]
 #[get("/delay/<seconds>")]
- async fn delay(seconds: u64) -> String {
-     sleep(Duration::from_secs(seconds)).await;
-     format!("Waited for {} seconds", seconds)
- }
+async fn delay(seconds: u64) -> String {
+    sleep(Duration::from_secs(seconds)).await;
+    format!("Waited for {} seconds", seconds)
+}
 
 #[launch]
 fn rocket() -> _ {
-    unsafe {
-        GREETINGS = Some(HashMap::new());
-    }
     rocket::build()
-        .mount("/", openapi_get_routes![index, delay, greet, query, new, retrieve])
+        .manage(AllGreetings { gr: DashMap::new() })
+        .mount(
+            "/",
+            openapi_get_routes![index, delay, greet, query, new, retrieve, teapot, greetings],
+        )
         .mount(
             "/swagger-ui/",
             make_swagger_ui(&SwaggerUIConfig {
