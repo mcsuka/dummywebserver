@@ -1,14 +1,18 @@
 #[macro_use]
 extern crate rocket;
 
+use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use dashmap::DashMap;
 
-use rocket::http::{ContentType, Status};
+use rocket::fairing::{Fairing, Info, Kind};
+use rocket::http::{ContentType, Status, Method, Header};
 use rocket::request::{self, FromRequest, Request};
 use rocket::response::status::NotFound;
 use rocket::serde::{json::Json, Deserialize};
 use rocket::tokio::time::{sleep, Duration};
-use rocket::State;
+use rocket::{State, Data, Response};
 
 use rocket_okapi::gen::OpenApiGenerator;
 use rocket_okapi::okapi::schemars;
@@ -156,26 +160,26 @@ fn retrieve(all_greetings: &State<AllGreetings>, id: u32) -> String {
 /**
 Return *"Hello \<message\>!"*
 */
-#[openapi(tag = "Hello")]
-#[get("/<message>")]
-fn greet(message: &str) -> String {
-    format!("Hello, {}!", message)
-}
+// #[openapi(tag = "Hello")]
+// #[get("/<message>")]
+// fn greet(message: &str) -> String {
+//     format!("Hello, {}!", message)
+// }
 
 /**
 Add a new greeting, identified by the `id`
 */
 #[openapi(tag = "Hello")]
 #[post("/", data = "<input>")]
-fn new(all_greetings: &State<AllGreetings>, input: Json<Greeting>) -> (Status, &'static str) {
+fn new(all_greetings: &State<AllGreetings>, input: Json<Greeting>) -> (Status, String) {
     let x = all_greetings
         .gr
         .entry(input.id)
         .or_insert_with(|| input.text.to_owned());
     if x.value() == &input.text {
-        (Status::Created, "")
+        (Status::Created, "".to_string())
     } else {
-        (Status::Conflict, "Greeting with id already exists")
+        (Status::Conflict, format!("Greeting with id {} already exists", input.id))
     }
 }
 
@@ -249,15 +253,69 @@ async fn imdb_title(db: &DbPool, id: &str) -> Result<Json<TitleBasics>, NotFound
     }
 }
 
+
+struct Counter {
+    get: AtomicUsize,
+    post: AtomicUsize,
+}
+
+impl Counter {
+    fn new() -> Counter {
+        Counter {
+            get: AtomicUsize::new(0),
+            post: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[rocket::async_trait]
+impl Fairing for Counter {
+    // This is a request and response fairing named "GET/POST Counter".
+    fn info(&self) -> Info {
+        Info {
+            name: "GET/POST Counter",
+            kind: Kind::Request | Kind::Response
+        }
+    }
+
+    // Increment the counter for `GET` and `POST` requests.
+    async fn on_request(&self, request: &mut Request<'_>, _: &mut Data<'_>) {
+        match request.method() {
+            Method::Get => self.get.fetch_add(1, Ordering::Relaxed),
+            Method::Post => self.post.fetch_add(1, Ordering::Relaxed),
+            _ => return
+        };
+    }
+
+    async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
+        // Don't change a successful user's response body.
+        if response.status() != Status::NotFound {
+            response.set_header(Header::new("X-GET-Count", self.get.load(Ordering::Relaxed).to_string()));
+            response.set_header(Header::new("X-POST-Count", self.post.load(Ordering::Relaxed).to_string()));
+        } else 
+        // Rewrite the response to return the current counts.
+        if request.method() == Method::Get && request.uri().path() == "/counts" {
+            let get_count = self.get.load(Ordering::Relaxed);
+            let post_count = self.post.load(Ordering::Relaxed);
+            let body = format!("Get: {}\nPost: {}\n", get_count, post_count);
+
+            response.set_status(Status::Ok);
+            response.set_header(ContentType::Plain);
+            response.set_sized_body(body.len(), Cursor::new(body));
+        }
+    }
+}
+
 #[launch]
 fn rocket() -> _ {
     rocket::build()
         .manage(AllGreetings { gr: DashMap::new() })
         .attach(DbPool::init())
+        .attach(Counter::new())
         .mount(
             "/",
             openapi_get_routes![
-                index, greet, query, new, retrieve, teapot, greetings, delay, imdb_title
+                index, query, new, retrieve, teapot, greetings, delay, imdb_title
             ],
         )
         .mount(
